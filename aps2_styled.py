@@ -1,7 +1,8 @@
-# aps2_styled.py
+ # aps2_styled.py
 # Dashboard APS 2025 — tarjetas + 3 paneles + planes de cuidado
 # Auto-carga: HMHOO.xlsx o el XLSX más reciente en ./ o ./data
 # BG = creationDateFormulario (fecha) | BH = creatorFormulario (responsable) | DK = EAPB (código → nombre)
+# Mejoras: filtro por fecha, desagregación por sexo, ámbito Urbano/Rural por EBS, grupos etarios solicitados
 
 import io
 import re
@@ -14,7 +15,7 @@ import numpy as np
 import plotly.express as px
 import streamlit as st
 
-st.set_page_config(page_title="APS HMHOO 2025 — APS RES. 2178", layout="wide")
+st.set_page_config(page_title="APS HMHOO 2025 — DASHBOARD", layout="wide")
 
 # ===== Ocultar menú de Streamlit (hamburguesa, Deploy y footer) =====
 st.markdown("""
@@ -310,13 +311,15 @@ def _load_eapb_mapping(uploaded_file) -> dict:
     if uploaded_file is None:
         return {}
     name = uploaded_file.name.lower()
+    raw = uploaded_file.read()
+    bio = io.BytesIO(raw)
     try:
         if name.endswith(".pdf"):
-            return _parse_eapb_from_pdf(uploaded_file.read())
+            return _parse_eapb_from_pdf(raw)
         elif name.endswith(".csv"):
-            dfmap = pd.read_csv(uploaded_file)
+            bio.seek(0); dfmap = pd.read_csv(bio)
         elif name.endswith(".xlsx") or name.endswith(".xls"):
-            dfmap = pd.read_excel(uploaded_file)
+            bio.seek(0); dfmap = pd.read_excel(bio)
         else:
             st.warning("Formato no soportado. Usa PDF/CSV/XLS/XLSX.")
             return {}
@@ -348,7 +351,7 @@ def _map_eapb_value(raw_value, mapping: dict) -> str:
     return str(raw_value) if pd.notna(raw_value) else "—"
 
 # ===============================
-# Planes de cuidado (reglas)
+# Planes de cuidado (reglas) — con alias seguros
 # ===============================
 @st.cache_data(show_spinner=False)
 def _load_care_rules(uploaded_xlsx) -> pd.DataFrame:
@@ -374,10 +377,22 @@ def _load_care_rules(uploaded_xlsx) -> pd.DataFrame:
 
 SAFE_NAMES = {'np': np, 'pd': pd}
 
+def _safe_alias(name: str) -> str:
+    s = "".join(ch for ch in unicodedata.normalize("NFD", str(name)) if unicodedata.category(ch) != "Mn")
+    s = re.sub(r"\W+", "_", s.strip().lower())
+    s = re.sub(r"^(\d)", r"_\1", s)
+    return s
+
+def _row_with_aliases(row: pd.Series) -> dict:
+    env = {}
+    for k, v in row.items():
+        env[_safe_alias(k)] = v
+    return env
+
 def _eval_condition(cond: str, row: pd.Series) -> bool:
     if not cond or not isinstance(cond, str):
         return False
-    env = {k: row.get(k, None) for k in row.index}
+    env = _row_with_aliases(row)
     env.update(SAFE_NAMES)
     try:
         return bool(eval(cond, {"__builtins__": {}}, env))
@@ -420,7 +435,7 @@ NIVEL_MAP = {
     1:'Sin escolaridad', 2:'Preescolar', 3:'Primaria completa',
     4:'Primaria incompleta', 5:'Secundaria completa', 6:'Secundaria incompleta',
     7:'Media técnica', 8:'Media académica', 9:'Técnica profesional',
-    10:'Tecnológica', 11:'Universitaria', 13:'Posgrado'
+    10:'Tecnológica', 11:'Universitaria', 12:'Universitaria', 13:'Posgrado'
 }
 
 # ===============================
@@ -490,8 +505,10 @@ except Exception as e:
 # ===============================
 # Encabezado con identidad visual
 # ===============================
-import os, glob
-BASE_DIR = Path(__file__).resolve().parent
+try:
+    BASE_DIR = Path(__file__).resolve().parent
+except Exception:
+    BASE_DIR = Path.cwd()
 
 def find_logo_path():
     patterns = [
@@ -545,9 +562,11 @@ st.caption(f"Caracterizaciones — Fuente: {source_name}")
 # ===============================
 # Normalizaciones de la base
 # ===============================
+# Edad
 if 'edad' in df.columns:
     df['edad'] = pd.to_numeric(df['edad'], errors='coerce')
 
+# Gestantes
 if 'esGestante' in df.columns:
     df['gestante_flag'] = (pd.to_numeric(df['esGestante'], errors='coerce') == 1).astype(int)
 elif 'gestantes' in df.columns:
@@ -555,26 +574,138 @@ elif 'gestantes' in df.columns:
 else:
     df['gestante_flag'] = 0
 
+# (Opcional) Lactancia: detecta si existe alguna columna equivalente
+col_lact = _find_col(df, ["lactante","lactancia","esLactante","lactando","lactante_flag"])
+if col_lact:
+    df['lactante_flag'] = (pd.to_numeric(df[col_lact], errors='coerce') == 1).astype(int)
+else:
+    df['lactante_flag'] = 0  # si no hay dato, quedará 0 y se mostrará nota
+
+# Nivel educativo
 if 'nivelEducativo' in df.columns:
     df['nivelEducativo'] = df['nivelEducativo'].map(NIVEL_MAP).fillna(df['nivelEducativo'])
 
+# Pertenencia étnica
 if 'pertenenciaEtnica' in df.columns:
     ETNIA_MAP = {1:'Indígena',2:'ROM (Gitano)',3:'Raizal',4:'Palenquero',5:'Negro/Afrocolombiano',6:'Otra',7:'Ninguna'}
     df['pertenenciaEtnica'] = pd.to_numeric(df['pertenenciaEtnica'], errors='coerce').map(ETNIA_MAP).fillna('No reportado')
 
-col_ebs = 'nroIdentificacionEBS' if 'nroIdentificacionEBS' in df.columns else None
-col_familia = 'parentglobFamilia' if 'parentglobFamilia' in df.columns else None
+# Columnas claves
+col_ebs = _find_col(df, ['nroIdentificacionEBS','ebs','id_territorio','idEBS'])
+col_familia = _find_col(df, ['parentglobFamilia','idFamilia','familia','grupoFamiliar'])
 col_id = 'globalid' if 'globalid' in df.columns else df.columns[0]  # Código de ficha
+col_sexo = _find_col(df, ['sexo','género','genero','sexo_biologico','sex'])
+
+# ===== Vectorización de fecha base para filtros y ordenamientos
+date_col = _find_col(df, ["creationDateFormulario"]) or _find_col(df, [
+    "fechaCaracterizacion","fechaCaracterización","fecha_caracterizacion",
+    "fecha_atencion","fecha_atención","fechaRegistro","fecha_registro","fecha"
+])
+if date_col:
+    df['_dt'] = pd.to_datetime(df[date_col], errors='coerce', dayfirst=True)
+else:
+    df['_dt'] = pd.NaT
+
+# ===== Ámbito Urbano/Rural por EBS (000–016 Urbano, 017–027 Rural)
+def _ambito_from_ebs(x) -> str:
+    if pd.isna(x):
+        return "No definido"
+    s = str(x)
+    m = re.search(r'(\d+)', s)
+    if not m:
+        return "No definido"
+    n = int(m.group(1))
+    if 0 <= n <= 16:
+        return "Urbano"
+    if 17 <= n <= 27:
+        return "Rural"
+    return "No definido"
+
+if col_ebs:
+    df['Ámbito'] = df[col_ebs].apply(_ambito_from_ebs)
+else:
+    df['Ámbito'] = "No definido"
+
+# ===== Sexo normalizado (M/F/No reportado)
+def _sexo_norm(v):
+    s = str(v).strip().lower()
+    if s in ["m","masculino","h","hombre","male","masc"]:
+        return "Masculino"
+    if s in ["f","femenino","mujer","female","feme","fem"]:
+        return "Femenino"
+    return "No reportado"
+
+if col_sexo:
+    df['Sexo'] = df[col_sexo].apply(_sexo_norm)
+else:
+    df['Sexo'] = "No reportado"
+
+# ===== Nombre completo cacheado
+try:
+    df["_nombre_completo_norm"] = _build_fullname_series(df, BASE_VERSION)
+except Exception:
+    df["_nombre_completo_norm"] = ""
+
+# ===== Grupos etarios solicitados
+def _grupo_etario(edad):
+    e = pd.to_numeric(edad, errors='coerce')
+    if pd.isna(e):
+        return "Sin dato"
+    e = int(e)
+    if e < 0:
+        return "Sin dato"
+    if 0 <= e <= 5:
+        return "Primera infancia (0–5)"
+    if 6 <= e <= 11:
+        return "Infancia (6–11)"
+    if 12 <= e <= 17:
+        return "Adolescencia (12–17)"
+    if 18 <= e <= 28:
+        return "Juventud (18–28)"
+    if 29 <= e <= 59:
+        return "Adultez (29–59)"
+    if e >= 60:
+        return "Persona mayor (60+)"
+    return "Sin dato"
+
+df['Grupo etario'] = df['edad'].apply(_grupo_etario) if 'edad' in df.columns else "Sin dato"
+
+# ===== Conjunto Gestantes y Lactantes
+df['Gestantes y lactantes'] = np.where((df['gestante_flag'] == 1) | (df['lactante_flag'] == 1), 1, 0)
 
 # ===============================
 # Filtros + Cargas auxiliares (EAPB y Planes de Cuidado)
 # ===============================
+# Filtro EBS
 if col_ebs:
     ebss = df[col_ebs].dropna().astype(str).unique()
     selected_ebs = st.sidebar.multiselect("Seleccione EBS", ebss, default=ebss)
-    df = df[df[col_ebs].astype(str).isin(selected_ebs)]
 else:
     st.sidebar.info("No se encontró la columna de EBS ('nroIdentificacionEBS').")
+    selected_ebs = None
+
+# Filtro Ámbito
+ambitos = df['Ámbito'].unique().tolist()
+sel_amb = st.sidebar.multiselect("Ámbito (Urbano/Rural)", ambitos, default=ambitos)
+
+# Filtro Sexo
+sexos = df['Sexo'].unique().tolist()
+sel_sexo = st.sidebar.multiselect("Sexo", sexos, default=sexos)
+
+# Filtro por fecha (rango)
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 🗓️ Filtro por fecha de caracterización")
+if df['_dt'].notna().any():
+    min_date = pd.to_datetime(df['_dt']).min().date()
+    max_date = pd.to_datetime(df['_dt']).max().date()
+    fecha_rango = st.sidebar.date_input("Rango (desde – hasta)", value=(min_date, max_date))
+    if isinstance(fecha_rango, tuple) and len(fecha_rango) == 2:
+        f_ini, f_fin = pd.to_datetime(fecha_rango[0]), pd.to_datetime(fecha_rango[1])
+    else:
+        f_ini, f_fin = pd.to_datetime(min_date), pd.to_datetime(max_date)
+else:
+    st.sidebar.info("No hay fechas válidas para filtrar.")
+    f_ini, f_fin = None, None
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 🏥 Tabla EAPB (PDF/CSV/Excel)")
@@ -607,14 +738,29 @@ with st.sidebar.form("form_name"):
     name_query = st.text_input("Nombre (parcial, sin tildes):", key="name_query")
     submitted_name = st.form_submit_button("Buscar por nombre")
 
+# ===== Aplicar filtros seleccionados a df base =====
+df_f = df.copy()
+
+if selected_ebs is not None and len(selected_ebs) > 0 and col_ebs:
+    df_f = df_f[df_f[col_ebs].astype(str).isin(selected_ebs)]
+
+if sel_amb:
+    df_f = df_f[df_f['Ámbito'].isin(sel_amb)]
+
+if sel_sexo:
+    df_f = df_f[df_f['Sexo'].isin(sel_sexo)]
+
+if f_ini is not None and f_fin is not None and df_f['_dt'].notna().any():
+    df_f = df_f[(df_f['_dt'] >= f_ini) & (df_f['_dt'] <= f_fin)]
+
 # ===============================
 # KPI (tarjetas)
 # ===============================
-total_personas = len(df)
-familias = df[col_familia].nunique() if col_familia else np.nan
-gestantes = int(df['gestante_flag'].sum()) if 'gestante_flag' in df.columns else np.nan
-adultos_mayores = int((df['edad'] >= 60).sum()) if 'edad' in df.columns else np.nan
-menores_5 = int((df['edad'] < 5).sum()) if 'edad' in df.columns else np.nan
+total_personas = len(df_f)
+familias = df_f[col_familia].nunique() if col_familia else np.nan
+gestantes = int(df_f['gestante_flag'].sum()) if 'gestante_flag' in df_f.columns else np.nan
+adultos_mayores = int((df_f['edad'] >= 60).sum()) if 'edad' in df_f.columns else np.nan
+menores_5 = int((df_f['edad'] < 5).sum()) if 'edad' in df_f.columns else np.nan
 
 fmt = lambda x: f"{int(x):,}".replace(",", ".") if pd.notna(x) else "—"
 cards = [
@@ -632,6 +778,9 @@ card_tpl = ("<div class='card'>"
 st.markdown("<div class='card-row'>" + "".join([card_tpl.format(**c) for c in cards]) + "</div>", unsafe_allow_html=True)
 
 # ===== Helper: listado estándar
+def _series_or_fill(df_sub, colname, fill="—"):
+    return df_sub[colname] if (colname in df_sub.columns) else pd.Series([fill]*len(df_sub))
+
 def _make_people_listing(df_sub: pd.DataFrame) -> pd.DataFrame:
     if df_sub is None or df_sub.empty:
         return pd.DataFrame()
@@ -641,7 +790,7 @@ def _make_people_listing(df_sub: pd.DataFrame) -> pd.DataFrame:
         "cedula","cédula","cc","doc","nro_doc","identificacion","identificación"
     ])
     edad_col = _find_col(df_sub, ["edad","edad_en_anios","edad_en_años"])
-    date_col = _find_col(df_sub, ["creationDateFormulario"]) or _find_col(df_sub, [
+    date_col_local = _find_col(df_sub, ["creationDateFormulario"]) or _find_col(df_sub, [
         "fechaCaracterizacion","fechaCaracterización","fecha_caracterizacion",
         "fecha_atencion","fecha_atención","fechaRegistro","fecha_registro","fecha"
     ])
@@ -657,13 +806,17 @@ def _make_people_listing(df_sub: pd.DataFrame) -> pd.DataFrame:
         except Exception:
             return "—"
 
-    eapb_series = df_sub[eapb_col].apply(lambda x: _map_eapb_value(x, EAPB_MAP)) if eapb_col else pd.Series(["—"] * len(df_sub))
+    eapb_series = _series_or_fill(df_sub, eapb_col) if eapb_col else pd.Series(["—"] * len(df_sub))
+    eapb_series = eapb_series.apply(lambda x: _map_eapb_value(x, EAPB_MAP))
 
     out = pd.DataFrame({
-        "EBS": df_sub[ebs_col].astype(str) if ebs_col else "—",
-        "Nombre completo": df_sub.apply(_full_name, axis=1),
-        "No. identificación": df_sub[doc_col].apply(_format_doc_for_display) if doc_col else "—",
-        "Edad": df_sub[edad_col].map(_safe_int) if edad_col else "—",
+        "EBS": _series_or_fill(df_sub, ebs_col).astype(str) if ebs_col else pd.Series(["—"]*len(df_sub)),
+        "Ámbito": df_sub.get("Ámbito", pd.Series(["—"]*len(df_sub))),
+        "Sexo": df_sub.get("Sexo", pd.Series(["No reportado"]*len(df_sub))),
+        "Grupo etario": df_sub.get("Grupo etario", pd.Series(["Sin dato"]*len(df_sub))),
+        "Nombre completo": df_sub["_nombre_completo_norm"] if "_nombre_completo_norm" in df_sub.columns else df_sub.apply(_full_name, axis=1),
+        "No. identificación": _series_or_fill(df_sub, doc_col).apply(_format_doc_for_display) if doc_col else pd.Series(["—"]*len(df_sub)),
+        "Edad": _series_or_fill(df_sub, edad_col).map(_safe_int) if edad_col else pd.Series(["—"]*len(df_sub)),
         "Barrio/Vereda": df_sub.apply(_pick_one_location, axis=1),
         "Dirección": df_sub.apply(_pick_address, axis=1),
         "Ubicación del hogar": df_sub.apply(_pick_home_location, axis=1),
@@ -672,18 +825,18 @@ def _make_people_listing(df_sub: pd.DataFrame) -> pd.DataFrame:
         "Territorio (cód.)": df_sub.apply(_pick_territory_code, axis=1),
         "Microterritorio (cód.)": df_sub.apply(_pick_microterritory_code, axis=1),
         "Rol en la familia": df_sub.apply(_pick_family_role, axis=1),
-        "Código de ficha": df_sub[col_id].astype(str) if col_id else "—",
-        "Num. Identificación Hogar": df_sub.get("numIdentificacionHogar", "—"),
-        "Num. Identificación Familia": df_sub.get("numIdentificacionFamilia", "—"),
+        "Código de ficha": df_sub[col_id].astype(str) if col_id else pd.Series(["—"]*len(df_sub)),
+        "Num. Identificación Hogar": df_sub.get("numIdentificacionHogar", pd.Series(["—"]*len(df_sub))),
+        "Num. Identificación Familia": df_sub.get("numIdentificacionFamilia", pd.Series(["—"]*len(df_sub))),
 
-        "Fecha de caracterización": df_sub.apply(_pick_char_date, axis=1) if date_col else "—",
-        "Responsable (creatorFormulario)": df_sub[resp_col].astype(str) if resp_col else "—",
-        "Familia": df_sub[fam_col].astype(str) if fam_col else "—",
+        "Fecha de caracterización": df_sub.apply(_pick_char_date, axis=1) if date_col_local else pd.Series(["—"]*len(df_sub)),
+        "Responsable (creatorFormulario)": _series_or_fill(df_sub, resp_col).astype(str) if resp_col else pd.Series(["—"]*len(df_sub)),
+        "Familia": _series_or_fill(df_sub, fam_col).astype(str) if fam_col else pd.Series(["—"]*len(df_sub)),
         "EAPB": eapb_series.astype(str),
     })
 
     try:
-        out["_dt_sort"] = pd.to_datetime(out["Fecha de caracterización"], errors="coerce")
+        out["_dt_sort"] = pd.to_datetime(out["Fecha de caracterización"], errors="coerce", dayfirst=True)
         out = out.sort_values(["_dt_sort","Nombre completo"], ascending=[False, True]).drop(columns=["_dt_sort"])
     except Exception:
         out = out.sort_values(["Nombre completo"], ascending=[True])
@@ -701,7 +854,7 @@ with c1:
         st.markdown("<div class='panel'>", unsafe_allow_html=True)
         if col_ebs:
             personas_ebs = (
-                df.groupby(col_ebs, dropna=True)
+                df_f.groupby(col_ebs, dropna=True)
                   .size().reset_index(name='Personas')
                   .sort_values('Personas', ascending=False)
             )
@@ -723,79 +876,107 @@ with c1:
         st.markdown("</div>", unsafe_allow_html=True)
 
 with c2:
-    st.markdown("<div class='section-title'>Nivel educativo</div>", unsafe_allow_html=True)
+    st.markdown("<div class='section-title'>Distribución por Sexo y Grupo etario</div>", unsafe_allow_html=True)
     st.markdown("<div class='panel'>", unsafe_allow_html=True)
-    if 'nivelEducativo' in df.columns:
-        edu_counts = (
-            df['nivelEducativo'].astype(str).replace({'nan':'No reportado'})
-              .value_counts(dropna=False).rename_axis('Nivel Educativo')
-              .reset_index(name='Personas').sort_values('Personas')
-        )
-        fig_edu = px.bar(
-            edu_counts, x='Personas', y='Nivel Educativo',
-            orientation='h', text='Personas', color='Nivel Educativo',
+    if 'Sexo' in df_f.columns and 'Grupo etario' in df_f.columns:
+        sex_grp = df_f.groupby(['Grupo etario','Sexo']).size().reset_index(name='Personas')
+        sex_grp = sex_grp.sort_values(['Grupo etario','Personas'])
+        fig_sex = px.bar(
+            sex_grp, x='Personas', y='Grupo etario',
+            color='Sexo', orientation='h', barmode='group', text='Personas',
             template='simple_white'
         )
-        fig_edu.update_traces(textposition='outside', cliponaxis=False)
-        fig_edu.update_layout(showlegend=False, height=320,
+        fig_sex.update_traces(textposition='outside', cliponaxis=False)
+        fig_sex.update_layout(showlegend=True, height=320,
                               margin=dict(l=10,r=10,t=40,b=10),
                               xaxis_title="Personas", yaxis_title="")
-        st.plotly_chart(fig_edu, use_container_width=True)
+        st.plotly_chart(fig_sex, use_container_width=True)
     else:
-        st.info("No se encontró 'nivelEducativo'.")
+        st.info("No se encontró 'Sexo' o 'Grupo etario'.")
     st.markdown("</div>", unsafe_allow_html=True)
 
 with c3:
-    st.markdown("<div class='section-title'>Pertenencia étnica</div>", unsafe_allow_html=True)
+    st.markdown("<div class='section-title'>Distribución por Ámbito y Grupo etario</div>", unsafe_allow_html=True)
     st.markdown("<div class='panel'>", unsafe_allow_html=True)
-    if 'pertenenciaEtnica' in df.columns:
-        etn_counts = (
-            df['pertenenciaEtnica'].astype(str)
-              .value_counts(dropna=False).rename_axis('Pertenencia étnica')
-              .reset_index(name='Personas').sort_values('Personas')
-        )
-        fig_etn = px.bar(
-            etn_counts, x='Personas', y='Pertenencia étnica',
-            orientation='h', text='Personas', color='Pertenencia étnica',
+    if 'Ámbito' in df_f.columns and 'Grupo etario' in df_f.columns:
+        amb_grp = df_f.groupby(['Grupo etario','Ámbito']).size().reset_index(name='Personas')
+        amb_grp = amb_grp.sort_values(['Grupo etario','Personas'])
+        fig_amb = px.bar(
+            amb_grp, x='Personas', y='Grupo etario',
+            color='Ámbito', orientation='h', barmode='group', text='Personas',
             template='simple_white'
         )
-        fig_etn.update_traces(textposition='outside', cliponaxis=False)
-        fig_etn.update_layout(showlegend=False, height=430,
+        fig_amb.update_traces(textposition='outside', cliponaxis=False)
+        fig_amb.update_layout(showlegend=True, height=430,
                               margin=dict(l=10,r=10,t=40,b=10),
                               xaxis_title="Personas", yaxis_title="")
-        st.plotly_chart(fig_etn, use_container_width=True)
+        st.plotly_chart(fig_amb, use_container_width=True)
     else:
-        st.info("No se encontró 'pertenenciaEtnica'.")
+        st.info("No se encontró 'Ámbito' o 'Grupo etario'.")
     st.markdown("</div>", unsafe_allow_html=True)
 
 # ===============================
-# NUEVA SECCIÓN: Listados rápidos
+# NUEVA SECCIÓN: Listados rápidos (incluye grupos etarios + Gestantes/Lactantes)
 # ===============================
 st.markdown("<div class='section-title'>Listados rápidos</div>", unsafe_allow_html=True)
 st.markdown("<div class='panel quick'>", unsafe_allow_html=True)
+
 b1, b2, b3 = st.columns(3)
+b4, b5, b6 = st.columns(3)
+b7, _, _ = st.columns(3)
+
 show = st.session_state.get("_quick_show", None)
 with b1:
-    if st.button("🤰 Ver gestantes"):
-        show = "gestantes"
+    if st.button("🤰 Gestantes / Lactantes"):
+        show = "gest_lact"
 with b2:
-    if st.button("🧓 Ver adultos mayores (60+)"):
-        show = "mayores"
+    if st.button("👶 Primera infancia (0–5)"):
+        show = "g_0_5"
 with b3:
-    if st.button("👶 Ver menores de 5 años"):
-        show = "menores5"
+    if st.button("🧒 Infancia (6–11)"):
+        show = "g_6_11"
+with b4:
+    if st.button("🧑 Adolescencia (12–17)"):
+        show = "g_12_17"
+with b5:
+    if st.button("🧑‍🎓 Juventud (18–28)"):
+        show = "g_18_28"
+with b6:
+    if st.button("🧍 Adultez (29–59)"):
+        show = "g_29_59"
+with b7:
+    if st.button("🧓 Persona mayor (60+)"):
+        show = "g_60_plus"
 st.session_state["_quick_show"] = show
 
+
+
+
 if show is not None:
-    if show == "gestantes":
-        df_sub = df[df.get('gestante_flag', 0) == 1].copy()
-        titulo = "Listado de gestantes"
-    elif show == "mayores":
-        df_sub = df[pd.to_numeric(df.get('edad', np.nan), errors='coerce') >= 60].copy()
-        titulo = "Listado de adultos mayores (60+)"
+    # Subconjunto según botón
+    if show == "gest_lact":
+        df_sub = df_f[(df_f['gestante_flag'] == 1) | (df_f['lactante_flag'] == 1)].copy()
+        titulo = "Madres Gestantes y Lactantes"
+        if col_lact is None:
+            st.info("Nota: No se encontró columna de lactancia; se muestran solo Gestantes.")
+    elif show == "g_0_5":
+        df_sub = df_f[df_f['Grupo etario'] == "Primera infancia (0–5)"].copy()
+        titulo = "Primera infancia (0–5)"
+    elif show == "g_6_11":
+        df_sub = df_f[df_f['Grupo etario'] == "Infancia (6–11)"].copy()
+        titulo = "Infancia (6–11)"
+    elif show == "g_12_17":
+        df_sub = df_f[df_f['Grupo etario'] == "Adolescencia (12–17)"].copy()
+        titulo = "Adolescencia (12–17)"
+    elif show == "g_18_28":
+        df_sub = df_f[df_f['Grupo etario'] == "Juventud (18–28)"].copy()
+        titulo = "Juventud (18–28)"
+    elif show == "g_29_59":
+        df_sub = df_f[df_f['Grupo etario'] == "Adultez (29–59)"].copy()
+        titulo = "Adultez (29–59)"
     else:
-        df_sub = df[pd.to_numeric(df.get('edad', np.nan), errors='coerce') < 5].copy()
-        titulo = "Listado de menores de 5 años"
+        df_sub = df_f[df_f['Grupo etario'] == "Persona mayor (60+)"].copy()
+        titulo = "Persona mayor (60+)"
 
     if df_sub.empty:
         st.info("No hay registros para mostrar con el filtro seleccionado.")
@@ -837,20 +1018,20 @@ else:
         if not query:
             st.warning("Escribe un número de cédula válido (solo dígitos).")
         else:
-            tmp = df.copy()
+            tmp = df_f.copy()  # usa el df filtrado por fecha/sexo/ámbito/EBS
             tmp["_doc_norm"] = tmp[doc_col].apply(_norm_doc)
             matches = tmp[tmp["_doc_norm"] == query].copy()
 
             if matches.empty:
                 st.error("No se encontraron personas con ese número de cédula.")
             else:
-                date_col = _find_col(matches, [
+                date_col_m = _find_col(matches, [
                     "creationDateFormulario",
                     "fechaCaracterizacion","fechaCaracterización","fecha_caracterizacion",
                     "fecha_atencion","fecha_atención","fechaRegistro","fecha_registro","fecha"
                 ])
-                if date_col:
-                    matches["_parsed_date"] = pd.to_datetime(matches[date_col], errors="coerce", dayfirst=True)
+                if date_col_m:
+                    matches["_parsed_date"] = pd.to_datetime(matches[date_col_m], errors="coerce", dayfirst=True)
                     matches = matches.sort_values("_parsed_date", ascending=False, na_position="last")
                 row = matches.iloc[0]
 
@@ -874,20 +1055,26 @@ else:
                 rol_familia    = _pick_family_role(row)
                 fecha_carac = _pick_char_date(row)
 
-                ebs_col = _find_col(df, ["nroIdentificacionEBS","ebs","id_territorio","idEBS"])
+                ebs_col_m = _find_col(df, ["nroIdentificacionEBS","ebs","id_territorio","idEBS"])
                 fam_col_g = _find_col(df, ["parentglobFamilia","idFamilia","familia","grupoFamiliar"])
                 resp_col = _find_col(df, ["creatorFormulario"])
                 eapb_col = _find_col(df, ["EAPB","eapb"])
 
-                ebs_val  = str(row.get(ebs_col, "—"))  if ebs_col else "—"
+                ebs_val  = str(row.get(ebs_col_m, "—"))  if ebs_col_m else "—"
                 fam_val  = str(row.get(fam_col_g, "—"))  if fam_col_g else "—"
                 resp_val = str(row.get(resp_col, "—")) if resp_col else "—"
                 eapb_val = _map_eapb_value(row.get(eapb_col, "—"), EAPB_MAP) if eapb_col else "—"
                 cod_ficha = str(row.get(col_id, "—")) if col_id else "—"
+                sexo_val = row.get('Sexo', 'No reportado')
+                amb_val = row.get('Ámbito', 'No definido')
+                grupo_val = row.get('Grupo etario', 'Sin dato')
 
                 res_df = pd.DataFrame([{
                     "Nombre completo": nombre_completo if nombre_completo else "—",
                     "No. identificación": no_ident,
+                    "Sexo": sexo_val,
+                    "Ámbito": amb_val,
+                    "Grupo etario": grupo_val,
                     "Edad": edad,
                     "Barrio/Vereda": barrio_vereda,
                     "Dirección": direccion,
@@ -906,7 +1093,7 @@ else:
                 }])
 
                 st.success("Ficha de la persona consultada:")
-                st.dataframe(res_df, use_container_width=True, height=260)
+                st.dataframe(res_df, use_container_width=True, height=300)
 
                 # ====== PLAN DE CUIDADO ======
                 plan_df = build_plan_for_person(row, CARE_RULES)
@@ -945,7 +1132,7 @@ else:
                 # ====== Resumen + Listado FAMILIA ======
                 if fam_col_g and pd.notna(row.get(fam_col_g, np.nan)):
                     fam_id = str(row.get(fam_col_g))
-                    df_fam = df[df[fam_col_g].astype(str) == fam_id].copy()
+                    df_fam = df_f[df_f[fam_col_g].astype(str) == fam_id].copy()
 
                     edades = pd.to_numeric(df_fam.get('edad', np.nan), errors='coerce')
                     fam_total     = len(df_fam)
@@ -996,21 +1183,21 @@ else:
 st.markdown("</div>", unsafe_allow_html=True)
 
 # ===============================
-# Buscador por nombre → ficha + PLAN DE CUIDADO + FAMILIA
+# Buscador por nombre → ficha + PLAN DE CUIDADO + FAMILIA (con filtros aplicados)
 # ===============================
 st.markdown("<div class='section-title'>Buscador por nombre</div>", unsafe_allow_html=True)
 st.markdown("<div class='panel'>", unsafe_allow_html=True)
 
 if submitted_name:
-    names_norm = _build_fullname_series(df, BASE_VERSION)
+    names_norm = _build_fullname_series(df_f, BASE_VERSION)
     q = _norm_text(name_query)
     if not q:
         st.warning("Escribe un nombre o parte del nombre para buscar.")
     else:
         idx = names_norm.str.contains(q, na=False)
-        found = df[idx].copy()
+        found = df_f[idx].copy()
         if found.empty:
-            st.error("No se encontraron personas que coincidan con ese nombre.")
+            st.error("No se encontraron personas que coincidan con ese nombre con los filtros actuales.")
         else:
             date_col_n = _find_col(found, [
                 "creationDateFormulario",
@@ -1026,7 +1213,7 @@ if submitted_name:
                 "cedula","cédula","cc","doc","nro_doc","identificacion","identificación"
             ])
             ebs_col_n  = _find_col(found, ["nroIdentificacionEBS","ebs","id_territorio","idEBS"])
-            fam_col_g  = _find_col(df, ["parentglobFamilia","idFamilia","familia","grupoFamiliar"])
+            fam_col_gn = _find_col(found, ["parentglobFamilia","idFamilia","familia","grupoFamiliar"])
             resp_col_n = _find_col(found, ["creatorFormulario"])
             eapb_col_n = _find_col(found, ["EAPB","eapb"])
 
@@ -1063,14 +1250,20 @@ if submitted_name:
             rol_familia    = _pick_family_role(row_sel)
             fecha_carac = _pick_char_date(row_sel)
             ebs_val  = str(row_sel.get(ebs_col_n, "—")) if ebs_col_n else "—"
-            fam_val  = str(row_sel.get(fam_col_g, "—"))  if fam_col_g else "—"
+            fam_val  = str(row_sel.get(fam_col_gn, "—"))  if fam_col_gn else "—"
             resp_val = str(row_sel.get(resp_col_n, "—")) if resp_col_n else "—"
             eapb_val = _map_eapb_value(row_sel.get(eapb_col_n, "—"), EAPB_MAP) if eapb_col_n else "—"
             cod_ficha = str(row_sel.get(col_id, "—")) if col_id else "—"
+            sexo_val = row_sel.get('Sexo', 'No reportado')
+            amb_val = row_sel.get('Ámbito', 'No definido')
+            grupo_val = row_sel.get('Grupo etario', 'Sin dato')
 
             res_name_df = pd.DataFrame([{
                 "Nombre completo": nombre_completo if nombre_completo else "—",
                 "No. identificación": no_ident,
+                "Sexo": sexo_val,
+                "Ámbito": amb_val,
+                "Grupo etario": grupo_val,
                 "Edad": edad,
                 "Barrio/Vereda": barrio_vereda,
                 "Dirección": direccion,
@@ -1089,7 +1282,7 @@ if submitted_name:
             }])
 
             st.success("Ficha de la persona seleccionada:")
-            st.dataframe(res_name_df, use_container_width=True, height=260)
+            st.dataframe(res_name_df, use_container_width=True, height=300)
 
             # ====== PLAN DE CUIDADO ======
             plan_df = build_plan_for_person(row_sel, CARE_RULES)
@@ -1112,9 +1305,9 @@ if submitted_name:
                     st.markdown(f"<a href='data:text/html;base64,{b64p}' target='_blank'>🖨️ Imprimir / Guardar como PDF</a>", unsafe_allow_html=True)
 
             # ====== Resumen + Listado FAMILIA ======
-            if fam_col_g and pd.notna(row_sel.get(fam_col_g, np.nan)):
-                fam_id = str(row_sel.get(fam_col_g))
-                df_fam = df[df[fam_col_g].astype(str) == fam_id].copy()
+            if fam_col_gn and pd.notna(row_sel.get(fam_col_gn, np.nan)):
+                fam_id = str(row_sel.get(fam_col_gn))
+                df_fam = df_f[df_f[fam_col_gn].astype(str) == fam_id].copy()
 
                 edades = pd.to_numeric(df_fam.get('edad', np.nan), errors='coerce')
                 fam_total     = len(df_fam)
@@ -1134,14 +1327,14 @@ if submitted_name:
                 st.markdown("<div class='card-row'>" + "".join([card_tpl.format(**c) for c in fam_cards]) + "</div>", unsafe_allow_html=True)
 
                 fam_listado = _make_people_listing(df_fam)
-                doc_col_f  = _find_col(df_fam, [
+                doc_col_f2  = _find_col(df_fam, [
                     "nroDocumento","numDocumento","numeroDocumento","documento",
                     "cedula","cédula","cc","doc","nro_doc","identificacion","identificación"
                 ])
-                if doc_col_f and doc_col_n:
+                if doc_col_f2 and doc_col_n:
                     sel_doc_norm = _norm_doc(row_sel.get(doc_col_n, ""))
                     fam_listado.insert(0, "Consultado",
-                        (df_fam[doc_col_f].apply(_norm_doc) == sel_doc_norm).map(lambda x: "✅" if x else "").values)
+                        (df_fam[doc_col_f2].apply(_norm_doc) == sel_doc_norm).map(lambda x: "✅" if x else "").values)
                 else:
                     fam_listado.insert(0, "Consultado", [""] * len(fam_listado))
 
@@ -1166,13 +1359,13 @@ if submitted_name:
 st.markdown("</div>", unsafe_allow_html=True)
 
 # ===============================
-# Listado general por EBS
+# Listado general por EBS (con Ámbito y Sexo)
 # ===============================
 st.markdown("<div class='section-title'>Listado de personas caracterizadas por EBS</div>", unsafe_allow_html=True)
 st.markdown("<div class='panel'>", unsafe_allow_html=True)
 
 if col_ebs:
-    df_list = df.copy()
+    df_list = df_f.copy()
     listado = _make_people_listing(df_list)
     st.dataframe(listado, use_container_width=True, height=500)
 
