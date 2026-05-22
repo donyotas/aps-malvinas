@@ -14,6 +14,7 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import streamlit as st
+import data_manager
 
 st.set_page_config(page_title="APS HMHOO 2025 — DASHBOARD", layout="wide")
 
@@ -470,37 +471,48 @@ padding:6px 10px 2px 10px;box-shadow:0 1px 3px rgba(0,0,0,.06)}
 st.markdown(STYLES, unsafe_allow_html=True)
 
 # ===============================
-# Datos base — AUTO (directorio) con fallback a adjuntar
+# Datos base — Carga optimizada con data_manager y Parquet
 # ===============================
-st.sidebar.title("Filtros")
-if st.sidebar.button("🔁 Recargar datos"):
+st.sidebar.title("Administración de Datos")
+
+# Botón para regenerar / optimizar datos
+if st.sidebar.button("🔁 Optimizar y Consolidar Datos (Excel → Parquet)"):
     st.cache_data.clear()
+    with st.spinner("Procesando archivos Excel y convirtiendo a Parquet..."):
+        msg_char = data_manager.consolidate_caracterizacion(force=True)
+        msg_aten = data_manager.consolidate_atenciones(force=True)
+    st.sidebar.success(f"{msg_char}\n{msg_aten}")
     st.rerun()
 
-data_file = None
-source_path = pick_default_excel()
+st.sidebar.markdown("---")
+st.sidebar.title("Filtros")
+
+df = pd.DataFrame()
 source_name = "—"
 BASE_VERSION = "0"
 
 try:
+    # Cargar caracterización consolidada
+    df = data_manager.load_caracterizacion_parquet()
+    source_name = "caracterizacion_consolidado.parquet"
+    st.sidebar.caption("⚡ Datos de caracterización cargados instantáneamente (Parquet)")
+except Exception as e:
+    st.sidebar.warning("No se encontró la base de datos optimizada en Parquet.")
+    source_path = pick_default_excel()
     if source_path and source_path.exists():
         BASE_VERSION = file_md5(str(source_path))
         df = load_excel_from_path(str(source_path), BASE_VERSION)
-        source_name = str(source_path)
-        st.sidebar.caption(f"Modo **auto**: {source_name}")
+        source_name = source_path.name
+        st.sidebar.caption(f"Cargado desde Excel: {source_name}")
     else:
-        data_file = st.sidebar.file_uploader("Cargar base .xlsx", type=["xlsx"], key="base_xlsx")
-        if data_file is None:
-            st.error("No encontré archivos XLSX en ./ o ./data. Coloca 'HMHOO.xlsx' o cualquier .xlsx allí, o súbelo aquí.")
-            st.stop()
-        file_bytes = data_file.getvalue()
-        BASE_VERSION = hashlib.md5(file_bytes).hexdigest()
-        df = load_excel_from_bytes(file_bytes)
-        source_name = data_file.name
-        st.sidebar.caption(f"Modo **adjunto**: {source_name}")
-except Exception as e:
-    st.error(f"No pude cargar el archivo de datos. Error: {e}")
-    st.stop()
+        st.error("No se encontró ninguna base de datos de caracterización (HMHOOV.xlsx o Parquet).")
+        st.stop()
+
+# Mostrar estado de atenciones médicas
+if Path("G:/aps-malvinas/atenciones_consolidado.parquet").exists():
+    st.sidebar.caption("🏥 Base de atenciones médicas cargada y cruzada")
+else:
+    st.sidebar.caption("⚠️ Sin base de atenciones médicas. Colócalas en 'atenciones' y presiona Optimizar.")
 
 # ===============================
 # Encabezado con identidad visual
@@ -1095,6 +1107,22 @@ else:
                 st.success("Ficha de la persona consultada:")
                 st.dataframe(res_df, use_container_width=True, height=300)
 
+                # ====== HISTORIAL DE ATENCIONES MÉDICAS (CRUCE) ======
+                st.markdown("### 🏥 Historial de Atención Prestada (Hospital Malvinas)")
+                df_atenciones_cruzadas = data_manager.query_atenciones_by_doc(query)
+                if df_atenciones_cruzadas.empty:
+                    st.info("No se registraron atenciones médicas para este usuario en las bases de datos cruzadas.")
+                else:
+                    st.dataframe(df_atenciones_cruzadas, use_container_width=True)
+                    ac1, ac2 = st.columns(2)
+                    with ac1:
+                        st.download_button("⬇️ CSV (Atenciones)", data=make_csv_bytes(df_atenciones_cruzadas),
+                                           file_name=f"atenciones_{query}.csv", mime="text/csv")
+                    with ac2:
+                        st.download_button("⬇️ Excel (Atenciones)", data=make_xlsx_bytes(df_atenciones_cruzadas),
+                                           file_name=f"atenciones_{query}.xlsx",
+                                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
                 # ====== PLAN DE CUIDADO ======
                 plan_df = build_plan_for_person(row, CARE_RULES)
                 st.markdown("**Sugerencias de Plan de Cuidado**")
@@ -1283,6 +1311,22 @@ if submitted_name:
 
             st.success("Ficha de la persona seleccionada:")
             st.dataframe(res_name_df, use_container_width=True, height=300)
+
+            # ====== HISTORIAL DE ATENCIONES MÉDICAS (CRUCE) ======
+            st.markdown("### 🏥 Historial de Atención Prestada (Hospital Malvinas)")
+            df_atenciones_cruzadas = data_manager.query_atenciones_by_doc(no_ident)
+            if df_atenciones_cruzadas.empty:
+                st.info("No se registraron atenciones médicas para este usuario en las bases de datos cruzadas.")
+            else:
+                st.dataframe(df_atenciones_cruzadas, use_container_width=True)
+                ac1, ac2 = st.columns(2)
+                with ac1:
+                    st.download_button("⬇️ CSV (Atenciones)", data=make_csv_bytes(df_atenciones_cruzadas),
+                                       file_name=f"atenciones_{no_ident}.csv", mime="text/csv")
+                with ac2:
+                    st.download_button("⬇️ Excel (Atenciones)", data=make_xlsx_bytes(df_atenciones_cruzadas),
+                                       file_name=f"atenciones_{no_ident}.xlsx",
+                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
             # ====== PLAN DE CUIDADO ======
             plan_df = build_plan_for_person(row_sel, CARE_RULES)

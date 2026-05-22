@@ -1,0 +1,25 @@
+# Evitar subir bases de datos y archivos confidenciales (Ley 1581 Habeas Data / Datos de Salud)
+*.xlsx
+*.xls
+*.csv
+*.parquet
+*.db
+*.sqlite
+
+# Entornos virtuales y dependencias
+venv/
+.venv/
+env/
+__pycache__/
+*.pyc
+
+# Configuración del editor y temporales de Windows
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+~$*.xlsx
+~$*.xls
+
+# Temporales de Streamlit
+.streamlit/config.toml
